@@ -1,5 +1,5 @@
-// etf-00909.js — 00909 專用：以「最佳化交易明細」為唯一口徑（最近買進、週次圖、KPI、明細）
-// 版本：kpi-opt-v10
+// etf-00909.js — 00909 專用：以「最佳化交易明細」為唯一口徑（最近買進/目前持有、週次圖、KPI、明細、基準）
+// 版本：kpi-opt-v10-fix2
 (function(){
   // ---------- 小工具 ----------
   const $ = s => document.querySelector(s);
@@ -123,13 +123,12 @@
 
     if (netShares <= 0) { bar.style.display='none'; bar.innerHTML=''; return; }
 
-    // 取出「最後一筆 SELL 之後」的所有 BUY（表示尚未平倉的段落）
+    // 取「最後一筆 SELL 之後」的所有 BUY（代表尚未平倉）
     let i = optExecs.length - 1;
     while (i >= 0 && optExecs[i].side !== 'SELL') i--;
     const openBuys = optExecs.slice(i + 1).filter(e => e.side === 'BUY');
     if (!openBuys.length) { bar.style.display='none'; bar.innerHTML=''; return; }
 
-    // 組裝多行：第一行是「目前持有：」，其後每筆 BUY 一行
     const rows = openBuys.map(b =>
       `買進　<b>${tsPretty(b.ts)}</b>　成交價格 <b>${Number(b.price).toFixed(2)}</b>　成交數量 <b>${fmtInt(b.shares)}</b>　持有數量 <b>${fmtInt(netShares)}</b>`
     );
@@ -141,7 +140,7 @@
   function splitSegments(execs){
     const segs = []; let cur = [];
     for (const e of execs) { cur.push(e); if (e.side === 'SELL') { segs.push(cur); cur = []; } }
-    if (cur.length) segs.push(cur);
+    if (cur.length) segs.push(cur); // 末段可能無 SELL
     return segs;
   }
   function fees(price, shares, isSell){
@@ -250,9 +249,11 @@
 
     for (const e of optExecs){
       if (e.side==='BUY'){ equity -= (e.cost||0); grossBuy += (e.buyAmount||0); }
-      else { equity += (e.sellAmount||0) - (e.fee||0) - (e.tax||0);
-             if (typeof e.pnlFull==='number'){ tradePnls.push(e.pnlFull); cumPnl += e.pnlFull; }
-             tradeFees.push(e.fee||0); tradeTaxes.push(e.tax||0); grossSell += (e.sellAmount||0); }
+      else {
+        equity += (e.sellAmount||0) - (e.fee||0) - (e.tax||0);
+        if (typeof e.pnlFull==='number'){ tradePnls.push(e.pnlFull); cumPnl += e.pnlFull; }
+        tradeFees.push(e.fee||0); tradeTaxes.push(e.tax||0); grossSell += (e.sellAmount||0);
+      }
       timeline.push({t:e.tsMs, eq:equity});
     }
 
@@ -261,6 +262,7 @@
     const days=[...byDay.keys()].sort(); const eqs=days.map(d=>byDay.get(d));
     const rets=[]; for(let i=1;i<eqs.length;i++){ const a=eqs[i-1], b=eqs[i]; if(a>0) rets.push(b/a-1); }
 
+    // 用 ΣpnlFull 計算總報酬與年化
     const t0=new Date(days[0]).getTime(), t1=new Date(days.at(-1)).getTime();
     const years=Math.max(1/365,(t1-t0)/(365*DAY_MS));
     const totalRet = cumPnl / OPT.capital;
@@ -313,14 +315,11 @@
 
     const totalFees=tradeFees.reduce((a,b)=>a+b,0);
     const totalTaxes=tradeTaxes.reduce((a,b)=>a+b,0);
-    const grossBuy=tradePnls.length?grossBuy:0; // 保留
-    const grossSell=tradePnls.length?grossSell:0;
-
     const turnover=(grossBuy+grossSell)/OPT.capital;
     const avgTradeValue=(grossBuy+grossSell)/Math.max(1,(wins.length+losses.length));
     const costRatio=(grossBuy+grossSell)>0? (totalFees+totalTaxes)/(grossBuy+grossSell) : 0;
 
-    const calmar = (Math.abs(ddSeries.length?Math.min(...ddSeries):0))>0 ? CAGR/Math.abs(Math.min(...ddSeries)) : 0;
+    const calmar = maxDD<0? CAGR/Math.abs(maxDD) : 0;
     const rtVol  = vol>0? annRet/vol : 0;
 
     return {
@@ -328,7 +327,7 @@
       equity : { days, series:eqs, ddSeries },
       returns: { daily: rets, annRet, vol, downside, VaR95, CVaR95, GainPain, Omega },
       pnl    : { trades: tradePnls, wins, losses, total: tradePnls.reduce((a,b)=>a+b,0), maxWin: Math.max(...tradePnls,0), maxLoss: Math.min(...tradePnls,0) },
-      risk   : { maxDD: (Math.min(...ddSeries)||0), TU_days: maxU, Rec_days: recDays, MCL: 0, UI, Martin },
+      risk   : { maxDD, TU_days: maxU, Rec_days: recDays, MCL: 0, UI, Martin },
       ratios : { CAGR, sharpe, sortino, calmar, rtVol, PF, hit, expectancy, payoff, totalRet },
       cost   : { totalFees, totalTaxes, costRatio, grossBuy, grossSell, turnover, avgTradeValue }
     };
@@ -478,7 +477,6 @@
         const raw = await fetch(manUrl, {cache:'no-store'});
         if (!raw.ok) throw new Error('manifest not found');
         const J = await raw.json();
-        // 盡可能容錯：常見欄位 latest / file / path / url 或 files[0]
         const candidate = J.latest || J.file || J.path || J.url || (Array.isArray(J.files)&&J.files[0]) || null;
         if (!candidate) throw new Error('manifest empty');
         const purl = /^https?:\/\//i.test(candidate) ? candidate : pubUrl(String(candidate));
@@ -494,7 +492,6 @@
   function seriesFromRows(rows){
     // 用 engine 的 parseCanon → backtest → 取每日權益
     const bt = backtest(rows);
-    // 回用 computeKPIFromOpt 的方式生成日末序列
     let equity = OPT.capital;
     const byDay = new Map();
     const events = [];
@@ -510,9 +507,8 @@
   }
 
   function alignRets(daysA, retsA, daysB, retsB){
-    // daysX 與 retsX 對齊成同長度
     const mapA=new Map(), mapB=new Map();
-    for(let i=1;i<daysA.length;i++) mapA.set(daysA[i], retsA[i-1]); // rets 對應「當天」
+    for(let i=1;i<daysA.length;i++) mapA.set(daysA[i], retsA[i-1]); // rets 對應當天
     for(let i=1;i<daysB.length;i++) mapB.set(daysB[i], retsB[i-1]);
     const keys=[...new Set([...mapA.keys(), ...mapB.keys()])].sort();
     const a=[], b=[];
@@ -559,7 +555,7 @@
     if (!arr.length) return 0;
     const win = arr.filter(v => v>0).length;
     return win / arr.length;
-    }
+  }
 
   async function renderBenchmark(K){
     try{
@@ -574,19 +570,23 @@
         tb.innerHTML = '<tr><td colspan="4">— 基準資料格式無法解析（需為交易/權益可推導格式）</td></tr>';
         return;
       }
-      // 產出基準日報酬
+
+      // 策略日報酬（用 K 的日序列）
       const S = { days: K.equity.days, eqs: K.equity.series };
       const srets=[]; for(let i=1;i<S.eqs.length;i++){ const a=S.eqs[i-1], b=S.eqs[i]; if(a>0) srets.push(b/a-1); }
+      // 基準日報酬
       const B = seriesFromRows(rowsB);
-
       const { a:retsS, b:retsB } = alignRets(S.days, srets, B.days, B.rets);
       if (!retsS.length){
         tb.innerHTML = '<tr><td colspan="4">— 基準與策略日期區間無交集</td></tr>';
         return;
       }
 
-      const annS = (meanStd(retsS).m)*252;
-      const annB = (meanStd(retsB).m)*252;
+      const { m:ms, s:ss } = meanStd(retsS);
+      const { m:mb, s:sb } = meanStd(retsB);
+      const annS = ms*252;
+      const annB = mb*252;
+
       const ex = retsS.map((v,i)=> v - retsB[i]);
       const te = meanStd(ex).s * Math.sqrt(252);
       const ir = te>0 ? (annS - annB) / te : 0;
